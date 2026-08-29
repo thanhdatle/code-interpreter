@@ -107,6 +107,25 @@ RUN apt-get update && \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
 
+# Bake a LibreOffice user profile at build time and install a soffice wrapper
+# that seeds it into the sandbox HOME on first use. The guest root is read-only
+# and HOME is a fresh per-session bind, so without this LibreOffice rebuilds its
+# profile on the first render of every session: ~7.5s cold versus ~3.6s warm
+# (measured on LO 26.2; this image ships 7.4.7 on 2 vCPU, so slower), against a
+# hard 30s SANDBOX_RUN_TIMEOUT that must also cover the document build,
+# rasterise and text extraction in the same execution.
+#
+# Converting a throwaway file here is also the build's own proof that soffice
+# can actually convert -- the build fails if it cannot.
+RUN mkdir -p /opt/lo-home \
+    && printf 'warm-up' > /tmp/lo-warm.txt \
+    && HOME=/opt/lo-home soffice --headless --convert-to pdf --outdir /tmp /tmp/lo-warm.txt \
+    && [ -s /tmp/lo-warm.pdf ] \
+    && rm -f /tmp/lo-warm.txt /tmp/lo-warm.pdf /opt/lo-home/.config/libreoffice/4/.lock
+
+COPY docker/soffice-wrapper.sh /usr/local/bin/soffice
+RUN chmod +x /usr/local/bin/soffice
+
 # Restore the standard Debian `awk` -> `mawk` symlink. mawk is Priority:
 # required so its binary is in /usr/bin already, but slim base images skip
 # the mawk postinst's `update-alternatives --install /usr/bin/awk awk
