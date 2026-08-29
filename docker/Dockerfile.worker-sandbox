@@ -109,6 +109,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 COPY docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
 
+# Document toolchain for the docx skill: soffice converts .docx -> PDF so the
+# agent can rasterise and visually verify its own output, pandoc reads
+# .docx -> markdown. The -nogui LibreOffice build is ~160 MB smaller on disk
+# than libreoffice-writer and still ships /usr/bin/soffice (via
+# libreoffice-common), which is all a headless --convert-to needs.
+#
+# fontconfig is required, not cosmetic: its 30-metric-aliases.conf is what maps
+# Times New Roman onto the metric-compatible Liberation Serif. Without it, and
+# with fonts-dejavu installed alongside, LibreOffice can silently substitute
+# DejaVu, whose different metrics change line breaks and page count versus
+# Word -- a render that looks fine but cannot be trusted for layout.
 RUN apt-install \
     coreutils \
     util-linux \
@@ -119,6 +130,9 @@ RUN apt-install \
     bc \
     jq \
     poppler-utils \
+    libreoffice-writer-nogui \
+    pandoc \
+    fontconfig \
     fonts-dejavu \
     fonts-liberation \
     libnl-route-3-200 \

@@ -70,6 +70,17 @@ FROM oven/bun:1.3.14-debian AS sandbox-build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Document toolchain for the docx skill: soffice converts .docx -> PDF so the
+# agent can rasterise and visually verify its own output, pandoc reads
+# .docx -> markdown. The -nogui LibreOffice build is ~160 MB smaller on disk
+# than libreoffice-writer and still ships /usr/bin/soffice (via
+# libreoffice-common), which is all a headless --convert-to needs.
+#
+# fontconfig is required, not cosmetic: its 30-metric-aliases.conf is what maps
+# Times New Roman onto the metric-compatible Liberation Serif. Without it, and
+# with fonts-dejavu installed alongside, LibreOffice can silently substitute
+# DejaVu, whose different metrics change line breaks and page count versus
+# Word -- a render that looks fine but cannot be trusted for layout.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     coreutils \
@@ -82,6 +93,9 @@ RUN apt-get update && \
     file \
     jq \
     poppler-utils \
+    libreoffice-writer-nogui \
+    pandoc \
+    fontconfig \
     fonts-dejavu \
     fonts-liberation \
     libnl-route-3-200 \
