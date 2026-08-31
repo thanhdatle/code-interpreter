@@ -211,7 +211,17 @@ export function isSameStorageObject(a: TFile, b: TFile): boolean {
   );
 }
 
-/** Bounds the ` (n)` search so a pathological request cannot spin here. */
+/**
+ * Bounds the ` (n)` search so a pathological request cannot spin here:
+ * how far `disambiguateDestination` counts before giving up. `max_input_files`
+ * is 256, so 65+ refs colliding on a single destination would exhaust the
+ * search. That is deliberately left as-is: an inline request in that shape
+ * fails cleanly with a 4xx from `prime()`'s pre-check, before
+ * `session.acquire()` and so without dirtying a session, and the
+ * by-reference variant needs 65 distinct storage objects whose
+ * Content-Disposition headers all resolve to one name. Raising the ceiling
+ * would only trade the bound for longer suffix chains on disk.
+ */
 const MAX_DESTINATION_SUFFIX = 64;
 
 /**
@@ -223,6 +233,9 @@ const MAX_DESTINATION_SUFFIX = 64;
  *
  * Returns undefined only when the directory alone leaves no room for a
  * one-character name — at which point no sibling of any kind can exist.
+ * A deeply nested path at exactly `max_path_length` can still reach that
+ * state, because the directory prefix and the extension are fixed and only
+ * the stem is ours to trim; the search then exhausts as before.
  */
 function fitDestinationStem(
   dir: string,
@@ -1033,10 +1046,29 @@ export class Job {
    * An untracked intermediate file the sandbox wrote and never surfaced can
    * still be replaced — the same exposure the authoritative-name path has
    * always had, since Content-Disposition can name any path.
+   *
+   * A file's OWN copy from a prior turn is not a hold. The caller replays the
+   * same attachments every turn, so a contested pair re-disambiguates to the
+   * same invented name each time; counting that name as taken would migrate
+   * it one suffix per turn (`(2)` -> `(3)` -> ...), abandon a copy on disk
+   * each time, and after `MAX_DESTINATION_SUFFIX` turns exhaust the search and
+   * throw — the permanent-kill pathology this change exists to remove, only
+   * slower.
    */
-  private sessionHoldsDestination(relPath: string): boolean {
+  private sessionHoldsDestination(relPath: string, file: TFile): boolean {
     if (!this.session) return false;
+    if (this.ownsPriorCopy(relPath, file)) return false;
     return this.session.isPrimedInput(relPath) || this.session.hasSurfacedOutput(relPath);
+  }
+
+  /**
+   * Whether `relPath` holds this exact storage object's copy from a prior
+   * turn. Replacing it is a refresh, not data loss. Inline files carry no
+   * storage identity, so they can never claim ownership.
+   */
+  private ownsPriorCopy(relPath: string, file: TFile): boolean {
+    if (!this.session || !file.id) return false;
+    return this.session.primedOwnerId(relPath) === this.inputIdentity(file);
   }
 
   /**
@@ -1067,7 +1099,7 @@ export class Job {
         destination,
         conflict[0],
         candidate => this.findDestinationConflict(candidate, file) !== undefined
-          || this.sessionHoldsDestination(candidate),
+          || this.sessionHoldsDestination(candidate, file),
       )
       : destination;
     for (const [reserved, owner] of this.inputDestinations) {
@@ -1119,7 +1151,7 @@ export class Job {
           file.name,
           requestedConflict[0],
           candidate => findRequestedConflict(candidate, file) !== undefined
-            || this.sessionHoldsDestination(candidate),
+            || this.sessionHoldsDestination(candidate, file),
         );
       }
       requestedDestinations.set(file.name, file);

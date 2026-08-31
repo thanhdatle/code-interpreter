@@ -686,3 +686,66 @@ describe('reuse of a prior turn\'s primed input', () => {
     }
   }, 30_000);
 });
+
+/**
+ * The caller replays the same attachment set on every turn of a conversation,
+ * so a contested pair is re-disambiguated from scratch each time. The invented
+ * name must therefore be STABLE across turns: if a file's own copy from the
+ * previous turn counted as an occupied destination, the pair would migrate one
+ * suffix per turn, strand an abandoned copy on disk each time, and after
+ * `MAX_DESTINATION_SUFFIX` turns exhaust the search and throw — the
+ * permanent-kill pathology this change removes, arriving slowly instead of
+ * immediately.
+ */
+describe('replaying a contested pair across turns', () => {
+  it('settles on a stable destination instead of climbing the suffix each turn', async () => {
+    const intruder: TFile = { id: 'stable-intruder-id', storage_session_id: 'prev-session', name: 'intruder-fallback.csv' };
+    const primed: TFile = { id: 'stable-primed-id', storage_session_id: 'prev-session', name: 'primed.csv' };
+    routes.set(objectPath(intruder), {
+      status: 200,
+      contentDisposition: 'attachment; filename="primed.csv"',
+      body: 'intruder bytes',
+    });
+    routes.set(objectPath(primed), {
+      status: 200,
+      contentDisposition: 'attachment; filename="primed.csv"',
+      body: 'primed object bytes',
+    });
+
+    const session = sessionWorkspaceAt(tmpDir, 'rt_contested_replay');
+    await fsp.writeFile(path.join(tmpDir, 'primed.csv'), 'primed last turn');
+    session.markPrimed(
+      'primed.csv',
+      inputCacheKey(primed.storage_session_id!, primed.id!),
+      false,
+      crypto.createHash('sha256').update('primed last turn').digest('hex'),
+    );
+
+    const originalConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 1;
+    const destinationsPerTurn: string[][] = [];
+    try {
+      for (let turn = 0; turn < 4; turn++) {
+        const job = makeJob([intruder, primed], session);
+        try {
+          await job.prime();
+          expect(session.dirtyReason).toBeUndefined();
+          destinationsPerTurn.push(primedNames(job));
+        } finally {
+          await job.cleanup();
+        }
+      }
+
+      /* Every turn resolves to the same two paths. */
+      for (const destinations of destinationsPerTurn) {
+        expect(destinations).toEqual(['primed.csv', 'primed (2).csv']);
+      }
+      /* And no abandoned copies accumulated on disk. */
+      expect(await entriesOf(tmpDir)).toEqual(['primed (2).csv', 'primed.csv']);
+      expect(await fsp.readFile(path.join(tmpDir, 'primed.csv'), 'utf8')).toBe('intruder bytes');
+      expect(await fsp.readFile(path.join(tmpDir, 'primed (2).csv'), 'utf8')).toBe('primed object bytes');
+    } finally {
+      config.prime_concurrency = originalConcurrency;
+    }
+  }, 30_000);
+});

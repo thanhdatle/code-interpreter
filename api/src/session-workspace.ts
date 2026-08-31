@@ -188,6 +188,13 @@ export class SessionWorkspace {
     return entry.id;
   }
 
+  /** Which storage object a prior turn primed at `relPath`, or undefined.
+   *  Unlike `primedInputId` this reports read-only primes too: it answers
+   *  "whose copy is this", not "may it be reused without re-downloading". */
+  primedOwnerId(relPath: string): string | undefined {
+    return this.primed.get(relPath)?.id;
+  }
+
   /** Whether `relPath` was primed as an input on any earlier turn (regardless
    *  of read-only). Such a file persists in the workspace, so a later turn that
    *  doesn't re-send it must not mistake it for a newly generated output. */
