@@ -14,6 +14,7 @@ import { metricsHandler, fileUploads, fileDownloads } from './metrics';
 import { httpMetricsMiddleware } from './middleware/httpMetrics';
 import { internalServiceAuthEnabled, requireInternalServiceAuth } from './internal-service-auth';
 import { shutdownTelemetry, traceHttpRequest } from './telemetry';
+import { MULTIPART_PARSE_OPTIONS } from './multipart';
 import logger from './fileServerLogger';
 import { env } from './config';
 import { redisKeepAliveOptions } from './redis-options';
@@ -329,13 +330,9 @@ app.post('/sessions/:session_id/objects', async (req: express.Request, res: expr
    *  should not surface as generated artifacts). */
   const readOnlyHeader = req.headers['x-read-only'];
   const readOnly = typeof readOnlyHeader === 'string' && readOnlyHeader.toLowerCase() === 'true';
-  /** busboy with proper charset handling and preservePath so subdirectory
-   *  components survive (e.g. `pptx/editing.md`); default strips to basename. */
   const busboy = b({
     headers: req.headers,
-    defCharset: 'utf8',
-    defParamCharset: 'utf8',
-    preservePath: true,
+    ...MULTIPART_PARSE_OPTIONS,
   });
   const uploadPromises: Promise<t.UploadResult | null>[] = [];
 

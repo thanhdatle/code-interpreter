@@ -14,6 +14,7 @@ import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, queueNames, conne
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
 import { env, jobCompletionWaitTimeoutMs, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
+import { MULTIPART_PARSE_OPTIONS } from '../multipart';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
@@ -358,14 +359,12 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
     let hasResponded = false;
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
-    /* preservePath keeps subdirectory components in the multipart filename
-     * (e.g. `pptx/editing.md`). The busboy 1.x default strips to basename,
-     * which collapses skill-file paths and breaks the caller's filename
-     * lookups (skill files look "missing" even when uploaded). */
+    /* See MULTIPART_PARSE_OPTIONS for why the charset and path options are not
+     * left at busboy's defaults. */
     const bb = busboy({
       headers: req.headers,
       limits: { fileSize: planFileSize },
-      preservePath: true,
+      ...MULTIPART_PARSE_OPTIONS,
     });
 
     const uploadPromises: Promise<t.UploadResult>[] = [];
@@ -571,11 +570,10 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     });
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
-    /* See note on the single-upload busboy above for why preservePath is set. */
     const bb = busboy({
       headers: req.headers,
       limits: { fileSize: planFileSize, files: MAX_BATCH_FILES },
-      preservePath: true,
+      ...MULTIPART_PARSE_OPTIONS,
     });
 
     const uploadPromises: Promise<t.BatchUploadFileResult>[] = [];
