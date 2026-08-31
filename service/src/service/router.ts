@@ -1,8 +1,8 @@
 import axios from 'axios';
-import busboy from 'busboy';
 import { nanoid } from 'nanoid';
 import { Router } from 'express';
 import type { Response } from 'express';
+import type { FileInfo } from 'busboy';
 import type { Readable } from 'stream';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
@@ -24,6 +24,7 @@ import { captureTraceCarrier, withSpan } from '../telemetry';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
 import { createUploadSessionRegistrar } from './upload-session';
+import { createMultipartParser } from '../multipart';
 import { prepareSandboxJobSecurity } from '../sandbox-egress';
 import logger from '../logger';
 
@@ -358,15 +359,9 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
     let hasResponded = false;
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
-    /* preservePath keeps subdirectory components in the multipart filename
-     * (e.g. `pptx/editing.md`). The busboy 1.x default strips to basename,
-     * which collapses skill-file paths and breaks the caller's filename
-     * lookups (skill files look "missing" even when uploaded). */
-    const bb = busboy({
-      headers: req.headers,
-      limits: { fileSize: planFileSize },
-      preservePath: true,
-    });
+    /* See `createMultipartParser` for why the charset and preservePath
+     * options are mandatory on every multipart entry point. */
+    const bb = createMultipartParser(req.headers, { fileSize: planFileSize });
 
     const uploadPromises: Promise<t.UploadResult>[] = [];
 
@@ -387,7 +382,7 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
       }
     });
 
-    bb.on('file', (_fieldname: string, file: Readable, info: busboy.FileInfo) => {
+    bb.on('file', (_fieldname: string, file: Readable, info: FileInfo) => {
       const { filename, mimeType } = info;
       const fileId = nanoid();
       const abortController = new AbortController();
@@ -571,11 +566,10 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     });
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
-    /* See note on the single-upload busboy above for why preservePath is set. */
-    const bb = busboy({
-      headers: req.headers,
-      limits: { fileSize: planFileSize, files: MAX_BATCH_FILES },
-      preservePath: true,
+    /* See note on the single-upload parser above. */
+    const bb = createMultipartParser(req.headers, {
+      fileSize: planFileSize,
+      files: MAX_BATCH_FILES,
     });
 
     const uploadPromises: Promise<t.BatchUploadFileResult>[] = [];
@@ -600,7 +594,7 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
       logger.warn(`[${INSTANCE_ID}] Batch upload files limit reached (${MAX_BATCH_FILES}) for session ${session_id}`);
     });
 
-    bb.on('file', (_fieldname: string, file: Readable, info: busboy.FileInfo) => {
+    bb.on('file', (_fieldname: string, file: Readable, info: FileInfo) => {
       const { filename, mimeType } = info;
       const fileId = nanoid();
       const abortController = new AbortController();

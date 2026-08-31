@@ -1,4 +1,3 @@
-import b from 'busboy';
 import path from 'path';
 import IORedis from 'ioredis';
 import express from 'express';
@@ -7,12 +6,14 @@ import { nanoid } from 'nanoid';
 import { PassThrough } from 'stream';
 import { pipeline } from 'stream/promises';
 import type { BucketItem, BucketItemStat, ClientOptions } from 'minio';
+import type { FileInfo } from 'busboy';
 import type { Readable } from 'stream';
 import type * as tls from 'tls';
 import type * as t from './types';
 import { metricsHandler, fileUploads, fileDownloads } from './metrics';
 import { httpMetricsMiddleware } from './middleware/httpMetrics';
 import { internalServiceAuthEnabled, requireInternalServiceAuth } from './internal-service-auth';
+import { createMultipartParser } from './multipart';
 import { shutdownTelemetry, traceHttpRequest } from './telemetry';
 import logger from './fileServerLogger';
 import { env } from './config';
@@ -329,17 +330,12 @@ app.post('/sessions/:session_id/objects', async (req: express.Request, res: expr
    *  should not surface as generated artifacts). */
   const readOnlyHeader = req.headers['x-read-only'];
   const readOnly = typeof readOnlyHeader === 'string' && readOnlyHeader.toLowerCase() === 'true';
-  /** busboy with proper charset handling and preservePath so subdirectory
-   *  components survive (e.g. `pptx/editing.md`); default strips to basename. */
-  const busboy = b({
-    headers: req.headers,
-    defCharset: 'utf8',
-    defParamCharset: 'utf8',
-    preservePath: true,
-  });
+  /* See `createMultipartParser` for why the charset and preservePath
+   * options are mandatory on every multipart entry point. */
+  const busboy = createMultipartParser(req.headers);
   const uploadPromises: Promise<t.UploadResult | null>[] = [];
 
-  busboy.on('file', (fieldname: string, file: Readable, info: b.FileInfo) => {
+  busboy.on('file', (fieldname: string, file: Readable, info: FileInfo) => {
     const { filename: combinedFilename, encoding: _e, mimeType } = info;
 
     // Handle the filename properly - it might be URL encoded

@@ -198,6 +198,71 @@ export function resolveOriginalName(response: Response, file: TFile): string {
 }
 
 /**
+ * True when two request files name the identical bytes in object storage.
+ * Inline content carries no storage identity (the constructor backfills
+ * `storage_session_id` for it), so the `id` check is what keeps two
+ * unrelated inline files from ever being mistaken for one object.
+ */
+export function isSameStorageObject(a: TFile, b: TFile): boolean {
+  return (
+    typeof a.id === 'string' && a.id.length > 0
+    && a.id === b.id
+    && a.storage_session_id === b.storage_session_id
+  );
+}
+
+/** Bounds the ` (n)` search so a pathological request cannot spin here. */
+const MAX_DESTINATION_SUFFIX = 64;
+
+/**
+ * Finds a free variant of an already-claimed destination by inserting
+ * ` (2)`, ` (3)`, … before the extension — the familiar "Downloads folder"
+ * rule. Two genuinely different objects that resolve to one name must both
+ * survive at distinguishable paths; failing the execution instead would kill
+ * every later turn of the conversation, since the caller replays the same
+ * attachment set each time.
+ *
+ * Candidates are re-validated because the suffix lengthens the path and
+ * could push it past `max_path_length`.
+ */
+export function disambiguateDestination(
+  destination: string,
+  isTaken: (candidate: string) => boolean,
+): string {
+  if (!isTaken(destination)) return destination;
+  const dir = path.posix.dirname(destination);
+  const base = path.posix.basename(destination);
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  for (let n = 2; n <= MAX_DESTINATION_SUFFIX; n++) {
+    const candidate = dir === '.' ? `${stem} (${n})${ext}` : `${dir}/${stem} (${n})${ext}`;
+    if (!isTaken(candidate) && isValidPathShape(candidate)) return candidate;
+  }
+  throw new ValidationError(
+    `Unable to find a free destination for "${destination}"`,
+  );
+}
+
+/**
+ * Outcome of claiming a path for an input file. `duplicate` means an
+ * earlier ref to the same storage object already owns the path, so this one
+ * carries no new bytes and is dropped rather than downloaded twice.
+ */
+type DestinationReservation =
+  | { status: 'reserved'; destination: string }
+  | { status: 'duplicate'; destination: string };
+
+/** Path-level collision: same path, or one path nested under the other. */
+function destinationsCollide(reserved: string, destination: string): boolean {
+  return (
+    reserved === destination
+    || reserved.startsWith(`${destination}/`)
+    || destination.startsWith(`${reserved}/`)
+  );
+}
+
+/**
  * Type-guard factory for the file server's normalized-detail response. Only
  * accepts objects whose `storage_session_id` matches `sid` exactly, closing
  * the MinIO prefix-list leak where listing `abc` also returns keys under
@@ -710,6 +775,11 @@ export class Job {
   private inheritedRefs: FileRef[] = [];
   private inputFileHashes = new Map<string, InputFileInfo>();
   private inputDestinations = new Map<string, TFile>();
+  /** Refs that resolved onto a destination an identical storage object
+   *  already owns. They stay in `this.files` (so nothing downstream has to
+   *  reason about a shrinking array) but are never downloaded, written, or
+   *  marked primed a second time. */
+  private droppedInputRefs = new Set<TFile>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
   /* Persistent session workspace (stateful mode). When set, the job reuses
@@ -883,52 +953,88 @@ export class Job {
     }
   }
 
+  private findDestinationConflict(
+    destination: string,
+    owner: TFile,
+  ): [string, TFile] | undefined {
+    return [...this.inputDestinations.entries()].find(
+      ([reserved, holder]) => holder !== owner && destinationsCollide(reserved, destination),
+    );
+  }
+
+  private releaseInputDestinations(file: TFile): void {
+    for (const [reserved, owner] of this.inputDestinations) {
+      if (owner === file) this.inputDestinations.delete(reserved);
+    }
+  }
+
   /**
    * Atomically replaces this ref's provisional/previous aliases with its
    * authoritative destination. There is no await in this transition: two
-   * concurrent downloads resolving to the same path cannot both pass the
-   * conflict check and start writing.
+   * concurrent downloads resolving to the same path cannot both claim it
+   * and start writing.
+   *
+   * A collision is resolved, never fatal. An earlier ref to the *same*
+   * storage object makes this one a duplicate to drop; a different object
+   * gets a disambiguated path. Throwing here used to abort the whole job,
+   * and because the caller replays the same attachments on every turn, one
+   * bad input permanently killed every later execution in the conversation.
    */
-  private reserveInputDestination(file: TFile, destination: string): void {
-    const conflict = [...this.inputDestinations.entries()].find(
-      ([reserved, owner]) =>
-        owner !== file
-        && (
-          reserved === destination
-          || reserved.startsWith(`${destination}/`)
-          || destination.startsWith(`${reserved}/`)
-        ),
-    );
-    if (conflict) {
-      throw new ValidationError(
-        `Conflicting input destinations: ${conflict[0]} and ${destination}`,
-      );
+  private reserveInputDestination(file: TFile, destination: string): DestinationReservation {
+    const conflict = this.findDestinationConflict(destination, file);
+    if (conflict && conflict[0] === destination && isSameStorageObject(conflict[1], file)) {
+      this.releaseInputDestinations(file);
+      return { status: 'duplicate', destination };
     }
+    const resolved = conflict
+      ? disambiguateDestination(
+        destination,
+        candidate => this.findDestinationConflict(candidate, file) !== undefined,
+      )
+      : destination;
     for (const [reserved, owner] of this.inputDestinations) {
-      if (owner === file && reserved !== destination) {
+      if (owner === file && reserved !== resolved) {
         this.inputDestinations.delete(reserved);
       }
     }
-    this.inputDestinations.set(destination, file);
+    this.inputDestinations.set(resolved, file);
+    return { status: 'reserved', destination: resolved };
   }
 
   async prime(): Promise<void> {
     this.inputDestinations.clear();
+    this.droppedInputRefs.clear();
     const requestedDestinations = new Map<string, TFile>();
+    const findRequestedConflict = (
+      destination: string,
+      owner: TFile,
+    ): [string, TFile] | undefined =>
+      [...requestedDestinations.entries()].find(
+        ([reserved, holder]) => holder !== owner && destinationsCollide(reserved, destination),
+      );
+
     for (const file of this.files) {
       validateFilePath(file.name, '/tmp/codeapi-request-validation');
-      const conflict = [...requestedDestinations.entries()].find(
-        ([destination, owner]) =>
-          owner !== file &&
-          (
-            destination === file.name ||
-            destination.startsWith(`${file.name}/`) ||
-            file.name.startsWith(`${destination}/`)
-          ),
-      );
-      if (conflict) {
-        throw new ValidationError(
-          `Conflicting input destinations: ${conflict[0]} and ${file.name}`,
+      const conflict = findRequestedConflict(file.name, file);
+      /* Same policy as `reserveInputDestination`, applied to the requested
+       * names: the same storage object attached twice is a duplicate to
+       * drop, not a conflict to fail on. */
+      if (conflict && conflict[0] === file.name && isSameStorageObject(conflict[1], file)) {
+        this.log.info(
+          { fileId: file.id, destination: file.name },
+          'Dropping a duplicate request ref for an already-claimed destination',
+        );
+        this.droppedInputRefs.add(file);
+        continue;
+      }
+      /* An inline destination is final, so a genuine collision has to be
+       * resolved now. A by-reference name is only a fallback until the
+       * download resolves its Content-Disposition, so leave it to
+       * `reserveInputDestination` rather than renaming on a guess. */
+      if (conflict && !file.id) {
+        file.name = disambiguateDestination(
+          file.name,
+          candidate => findRequestedConflict(candidate, file) !== undefined,
         );
       }
       requestedDestinations.set(file.name, file);
@@ -992,6 +1098,7 @@ export class Job {
 
     const fileOps: Array<() => Promise<void>> = [];
     for (const file of this.files) {
+      if (this.droppedInputRefs.has(file)) continue;
       const operationContext: PrimeOperationContext = {
         ...operationBase,
         signal: controller.signal,
@@ -1042,10 +1149,25 @@ export class Job {
        * its requested name becomes authoritative only after the on-disk copy
        * has been verified. Reserve it before another concurrent ref can claim
        * and overwrite that path. */
-      this.reserveInputDestination(file, file.name);
-      return;
+      const reservation = this.reserveInputDestination(file, file.name);
+      if (reservation.status === 'duplicate') {
+        this.log.info(
+          { fileId: file.id, destination: file.name },
+          'Dropping a duplicate ref already primed at this destination',
+        );
+        this.droppedInputRefs.add(file);
+        return;
+      }
+      /* An exact reservation means the verified on-disk copy is ours to keep.
+       * A disambiguated one means a different object owns this path, so the
+       * reused bytes are NOT at the reserved destination — drop the stale
+       * hash and download to the new path instead. */
+      if (reservation.destination === file.name) return;
+      this.releaseInputDestinations(file);
+      this.inputFileHashes.delete(file.name);
     }
     const name = await this.downloadAndWriteFile(file, 5, 500, context);
+    if (this.droppedInputRefs.has(file)) return;
     if (this.session && file.id) {
       /* Record read-only so the next turn re-downloads it (primedInputId reports
        * read-only primes as not-primed) — a reused on-disk copy could have been
@@ -1262,8 +1384,30 @@ export class Job {
 
         const originalName = resolveOriginalName(response, file);
         validateFilePath(originalName, operation.submissionDir);
-        this.reserveInputDestination(file, originalName);
-        const finalPath = path.join(operation.submissionDir, originalName);
+        const reservation = this.reserveInputDestination(file, originalName);
+        /* An earlier ref to the identical storage object already owns this
+         * path, so these bytes are already on disk. Drop the response instead
+         * of writing the same object twice — and, critically, instead of
+         * failing the execution. */
+        if (reservation.status === 'duplicate') {
+          await response.body?.cancel().catch(() => {});
+          this.droppedInputRefs.add(file);
+          if (originalName !== file.name) file.name = originalName;
+          this.log.info(
+            { fileId: file.id, destination: originalName },
+            'Dropping a duplicate input ref that resolved onto a claimed destination',
+          );
+          return originalName;
+        }
+        const destination = reservation.destination;
+        if (destination !== originalName) {
+          validateFilePath(destination, operation.submissionDir);
+          this.log.info(
+            { fileId: file.id, resolved: originalName, destination },
+            'Disambiguated a colliding input destination',
+          );
+        }
+        const finalPath = path.join(operation.submissionDir, destination);
         const finalParent = path.dirname(finalPath);
         /* Persistent-session workspaces can hold a prior turn's symlink, so build
          * ancestors no-follow; a fresh per-job workspace can use plain mkdir -p. */
@@ -1291,7 +1435,7 @@ export class Job {
           operation.signal,
         );
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
-        this.inputFileHashes.set(originalName, {
+        this.inputFileHashes.set(destination, {
           originalId: file.id,
           originalSessionId: file.storage_session_id!,
           hash,
@@ -1306,13 +1450,14 @@ export class Job {
 
         /* Keep the in-memory TFile in sync with the on-disk name so that
          * inputByName lookups in handleSessionFiles match walkDir's
-         * path.relative() output. Otherwise a Content-Disposition override
-         * would leave file.name pointing at the client-submitted name while
-         * the file lives under originalName on disk. */
-        if (originalName !== file.name) file.name = originalName;
+         * path.relative() output. Otherwise a Content-Disposition override —
+         * or a disambiguated collision — would leave file.name pointing at
+         * the client-submitted name while the file lives elsewhere on disk,
+         * and the /exec response would report a path that does not exist. */
+        if (destination !== file.name) file.name = destination;
 
-        this.log.info({ file: originalName, hash: hash.substring(0, 8) }, 'Downloaded file');
-        return originalName;
+        this.log.info({ file: destination, hash: hash.substring(0, 8) }, 'Downloaded file');
+        return destination;
       } catch (error: unknown) {
         if (response?.body && !response.bodyUsed) {
           await response.body.cancel().catch(() => {});

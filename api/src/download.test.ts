@@ -3,7 +3,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import * as semver from 'semver';
-import { Job, SessionWorkspaceDirtyError, type TFile } from './job';
+import { Job, type TFile } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
 import { SANDBOX_DIR_MODE, SANDBOX_FILE_MODE } from './validation';
@@ -331,7 +331,12 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     }
   });
 
-  it('rejects concurrent refs that resolve to the same destination before either can overwrite', async () => {
+  /* Policy change: a destination collision between two DIFFERENT storage
+   * objects used to fail the whole execution. The caller replays the same
+   * attachment set on every turn, so that made one bad input permanently
+   * fatal for the conversation. Both objects now survive at distinguishable
+   * destinations instead, and neither overwrites the other. */
+  it('disambiguates concurrent refs that resolve to the same destination instead of overwriting', async () => {
     const slower: TFile = {
       id: 'same-slower-id',
       storage_session_id: 'prev-session',
@@ -373,12 +378,12 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
         }),
       ]);
       if (deadlockTimer) clearTimeout(deadlockTimer);
-      expect(outcome.status).toBe('rejected');
-      if (outcome.status === 'rejected') {
-        expect(outcome.error).toBeInstanceOf(SessionWorkspaceDirtyError);
-      }
-      expect(dirty).toBe(true);
+      expect(outcome.status).toBe('fulfilled');
+      expect(dirty).toBe(false);
+      /* Both bodies land, and neither clobbers the other. The faster ref
+       * claims the resolved name; the slower one takes the suffixed variant. */
       expect(await fsp.readFile(path.join(tmpDir, 'same.txt'), 'utf8')).toBe('faster bytes');
+      expect(await fsp.readFile(path.join(tmpDir, 'same (2).txt'), 'utf8')).toBe('slower bytes');
     } finally {
       if (deadlockTimer) clearTimeout(deadlockTimer);
       config.prime_concurrency = originalPrimeConcurrency;
