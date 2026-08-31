@@ -1,39 +1,26 @@
 #!/bin/sh
-# Prepare LibreOffice's environment before handing off to the real binary.
+# Keep LibreOffice's conversion temporaries off the sandbox's small /tmp.
 #
-# Two problems, both specific to running LibreOffice inside this sandbox, and
-# both fixed here rather than by loosening a global limit for every job.
+# /tmp is a 20 MB tmpfs (api/config/sandbox.cfg). When it is close to full,
+# LibreOffice does not fail -- it exits 0 and silently drops content. Measured
+# in this image against a 40-page document carrying 8.7 MB of JPEG, with /tmp
+# holding 280 KB free:
 #
-# 1. Profile. The guest root is read-only and HOME (/mnt/data) is a fresh
-#    per-session bind, so LibreOffice would rebuild its user profile from
-#    scratch on the first render of every session. Measured cost of that cold
-#    start is ~7.5s versus ~3.6s warm, against a run timeout that must also
-#    cover the document build, the rasterise and the text extraction. The
-#    profile is baked into the image at /opt/lo-home and copied in (~0.5 MB).
+#     TMPDIR=/tmp          rc=0   25 KB PDF   40 pages    0 images
+#     TMPDIR=$HOME/.lo-tmp rc=0  762 KB PDF   40 pages   40 images
 #
-# 2. Temporary files. LibreOffice's conversion temporaries default to /tmp,
-#    which is a 20 MB tmpfs (api/config/sandbox.cfg). A document carrying images
-#    can exhaust that and fail --convert-to outright. Point TMPDIR at the
-#    disk-backed writable bind instead. The dot prefix matters: the output
-#    walker skips hidden directories, so this never surfaces as a generated
-#    file.
+# A render that quietly loses its images is precisely the output this project
+# exists to prevent, and no exit status reports it. LibreOffice's own peak
+# demand is small -- 952 KB for that document -- so the redirect costs nothing;
+# it is the other occupants of the 20 MB tmpfs that make the hazard real.
 #
-# Neither step may break a render that would otherwise work: a cold profile is
-# slower, not broken, and a missing TMPDIR just falls back to /tmp. Every step
-# degrades to plain soffice on failure.
+# The dot prefix matters: the generated-output walker skips hidden directories,
+# so this never surfaces as a file the agent produced. Every step degrades to
+# plain soffice: a missing or unwritable HOME just leaves TMPDIR alone.
 set -u
 
-home=${HOME:-/tmp}
-baked=/opt/lo-home/.config/libreoffice
-
-if [ ! -d "$home/.config/libreoffice" ] && [ -d "$baked" ]; then
-    mkdir -p "$home/.config" 2>/dev/null \
-        && cp -a "$baked" "$home/.config/" 2>/dev/null \
-        || true
-fi
-
-if mkdir -p "$home/.lo-tmp" 2>/dev/null; then
-    TMPDIR="$home/.lo-tmp"
+if [ -w "${HOME:-/nonexistent}" ] && mkdir -p "$HOME/.lo-tmp" 2>/dev/null; then
+    TMPDIR="$HOME/.lo-tmp"
     export TMPDIR
 fi
 
