@@ -32,3 +32,4 @@ ejs@5.0.2
 archiver@7.0.1
 adm-zip@0.5.17
 pptxgenjs@4.0.1
+docx@9.7.1
