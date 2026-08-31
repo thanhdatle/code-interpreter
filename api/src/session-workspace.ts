@@ -164,6 +164,14 @@ export class SessionWorkspace {
     return this.surfaced.get(relPath) === hash;
   }
 
+  /** Whether any output has been surfaced at `relPath`, whatever its content.
+   *  Lets a caller inventing a destination avoid renaming over a prior turn's
+   *  output, which `isSurfaced` cannot answer without already knowing the
+   *  hash of bytes that have not been written yet. */
+  hasSurfacedOutput(relPath: string): boolean {
+    return this.surfaced.has(relPath);
+  }
+
   markSurfaced(relPath: string, hash: string): void {
     this.surfaced.set(relPath, hash);
   }

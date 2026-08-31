@@ -13,16 +13,33 @@ function messageOf(fn: () => void): string {
 }
 
 describe('execute file validation', () => {
-  test('rejects duplicate and ancestor-conflicting destinations before priming', () => {
-    expect(messageOf(() => validateExecuteFiles([
+  /* CONTRACT CHANGE: colliding destinations used to be a 400. Attaching one
+   * file twice, or two different files that share a name, are ordinary user
+   * actions, and rejecting the request failed the whole execution. They are
+   * accepted here and resolved during priming instead (deduped or renamed to
+   * `name (2).ext`), with the response reporting each file's real path. */
+  test('accepts colliding destinations and leaves them for priming to resolve', () => {
+    expect(() => validateExecuteFiles([
       { name: 'data.csv', content: 'a' },
       { name: 'data.csv', content: 'b' },
-    ]))).toContain('duplicate destination');
+    ])).not.toThrow();
 
-    expect(messageOf(() => validateExecuteFiles([
+    expect(() => validateExecuteFiles([
       { name: 'results', content: 'file' },
       { name: 'results/out.csv', content: 'nested' },
-    ]))).toContain('conflicting destinations');
+    ])).not.toThrow();
+
+    expect(() => validateExecuteFiles([
+      { id: 'masked', storage_session_id: 'masked-session', name: 'report.docx' },
+      { id: 'masked', storage_session_id: 'masked-session', name: 'report.docx' },
+    ])).not.toThrow();
+  });
+
+  test('still rejects destinations that are not valid paths', () => {
+    expect(messageOf(() => validateExecuteFiles([{ name: '../escape.csv', content: 'a' }])))
+      .toContain('is invalid');
+    expect(messageOf(() => validateExecuteFiles([{ name: '/abs.csv', content: 'a' }])))
+      .toContain('is invalid');
   });
 
   test('rejects malformed stable cache identities', () => {

@@ -215,28 +215,72 @@ export function isSameStorageObject(a: TFile, b: TFile): boolean {
 const MAX_DESTINATION_SUFFIX = 64;
 
 /**
- * Finds a free variant of an already-claimed destination by inserting
+ * Trims `stem` so that `dir/stem + suffix + ext` fits inside
+ * `max_path_length`. A name already at the limit would otherwise have no
+ * valid variant at all, and throwing there would resurrect the exact
+ * pathology this whole change removes: the same request replays every turn,
+ * so a deterministic throw kills the conversation permanently.
+ *
+ * Returns undefined only when the directory alone leaves no room for a
+ * one-character name — at which point no sibling of any kind can exist.
+ */
+function fitDestinationStem(
+  dir: string,
+  stem: string,
+  suffix: string,
+  ext: string,
+): string | undefined {
+  const prefix = dir === '.' ? 0 : dir.length + 1;
+  const room = config.max_path_length - prefix - suffix.length - ext.length;
+  if (room < 1) return undefined;
+  if (stem.length <= room) return stem;
+  let trimmed = stem.slice(0, room);
+  /* `max_path_length` counts UTF-16 code units, so a cut can land between a
+   * surrogate pair and leave an unpaired half. Drop it rather than emit a
+   * filename containing a lone surrogate. */
+  if (/[\uD800-\uDBFF]$/.test(trimmed)) trimmed = trimmed.slice(0, -1);
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Invents a free variant of an already-claimed destination by inserting
  * ` (2)`, ` (3)`, … before the extension — the familiar "Downloads folder"
  * rule. Two genuinely different objects that resolve to one name must both
  * survive at distinguishable paths; failing the execution instead would kill
  * every later turn of the conversation, since the caller replays the same
  * attachment set each time.
  *
- * Candidates are re-validated because the suffix lengthens the path and
- * could push it past `max_path_length`.
+ * Only ever called once the caller has established a real conflict, so it
+ * always returns a variant and never the input. `isTaken` therefore judges
+ * invented candidates only — it must be stricter than the conflict test that
+ * got us here (see `Job.sessionHoldsDestination`), because an invented name
+ * is the one destination the caller never asked for.
+ *
+ * `conflict` is the reserved path that clashed, and it decides WHERE the
+ * suffix goes. A reserved file sitting at an ancestor of this destination
+ * blocks the entire subtree beneath it, so renaming the basename would
+ * collide forever — that ancestor component is what has to move
+ * (`results` + `results/out.csv` -> `results (2)/out.csv`).
  */
 export function disambiguateDestination(
   destination: string,
+  conflict: string,
   isTaken: (candidate: string) => boolean,
 ): string {
-  if (!isTaken(destination)) return destination;
-  const dir = path.posix.dirname(destination);
-  const base = path.posix.basename(destination);
+  const blockedByAncestor = destination.startsWith(`${conflict}/`);
+  const head = blockedByAncestor ? conflict : destination;
+  const tail = blockedByAncestor ? destination.slice(conflict.length) : '';
+  const dir = path.posix.dirname(head);
+  const base = path.posix.basename(head);
   const dot = base.lastIndexOf('.');
   const stem = dot > 0 ? base.slice(0, dot) : base;
   const ext = dot > 0 ? base.slice(dot) : '';
   for (let n = 2; n <= MAX_DESTINATION_SUFFIX; n++) {
-    const candidate = dir === '.' ? `${stem} (${n})${ext}` : `${dir}/${stem} (${n})${ext}`;
+    const suffix = ` (${n})`;
+    const fitted = fitDestinationStem(dir, stem, suffix, ext + tail);
+    if (fitted === undefined) break;
+    const renamed = `${fitted}${suffix}${ext}`;
+    const candidate = (dir === '.' ? renamed : `${dir}/${renamed}`) + tail;
     if (!isTaken(candidate) && isValidPathShape(candidate)) return candidate;
   }
   throw new ValidationError(
@@ -252,6 +296,13 @@ export function disambiguateDestination(
 type DestinationReservation =
   | { status: 'reserved'; destination: string }
   | { status: 'duplicate'; destination: string };
+
+/**
+ * Result of trying to reuse a prior turn's on-disk copy of an input.
+ * `contested` means the copy was valid but a different storage object now
+ * owns that path, so the ref must be downloaded to a destination of its own.
+ */
+type ReuseOutcome = 'miss' | 'reused' | 'duplicate' | 'contested';
 
 /** Path-level collision: same path, or one path nested under the other. */
 function destinationsCollide(reserved: string, destination: string): boolean {
@@ -969,6 +1020,26 @@ export class Job {
   }
 
   /**
+   * Whether a prior turn of this session already tracks a file at `relPath`.
+   *
+   * Consulted ONLY when inventing a disambiguated name. A requested or
+   * Content-Disposition destination that matches a prior turn's file is the
+   * normal reuse/overwrite path and must stay untouched — but an invented
+   * `name (2)` that lands on an earlier turn's input or surfaced output would
+   * silently rename over it, which is data loss the old throw could not
+   * produce.
+   *
+   * This covers what the session tracks: primed inputs and surfaced outputs.
+   * An untracked intermediate file the sandbox wrote and never surfaced can
+   * still be replaced — the same exposure the authoritative-name path has
+   * always had, since Content-Disposition can name any path.
+   */
+  private sessionHoldsDestination(relPath: string): boolean {
+    if (!this.session) return false;
+    return this.session.isPrimedInput(relPath) || this.session.hasSurfacedOutput(relPath);
+  }
+
+  /**
    * Atomically replaces this ref's provisional/previous aliases with its
    * authoritative destination. There is no await in this transition: two
    * concurrent downloads resolving to the same path cannot both claim it
@@ -981,15 +1052,22 @@ export class Job {
    * bad input permanently killed every later execution in the conversation.
    */
   private reserveInputDestination(file: TFile, destination: string): DestinationReservation {
-    const conflict = this.findDestinationConflict(destination, file);
-    if (conflict && conflict[0] === destination && isSameStorageObject(conflict[1], file)) {
+    /* Test the exact holder first. Scanning for *any* colliding entry would
+     * let an unrelated nesting conflict mask an identical-object holder at
+     * this very path, and we would then write the same object twice under a
+     * suffix instead of deduping it. */
+    const holder = this.inputDestinations.get(destination);
+    if (holder && holder !== file && isSameStorageObject(holder, file)) {
       this.releaseInputDestinations(file);
       return { status: 'duplicate', destination };
     }
+    const conflict = this.findDestinationConflict(destination, file);
     const resolved = conflict
       ? disambiguateDestination(
         destination,
-        candidate => this.findDestinationConflict(candidate, file) !== undefined,
+        conflict[0],
+        candidate => this.findDestinationConflict(candidate, file) !== undefined
+          || this.sessionHoldsDestination(candidate),
       )
       : destination;
     for (const [reserved, owner] of this.inputDestinations) {
@@ -1013,13 +1091,17 @@ export class Job {
         ([reserved, holder]) => holder !== owner && destinationsCollide(reserved, destination),
       );
 
+    /* `validateExecuteFiles` deliberately no longer rejects colliding
+     * requested destinations, so this is the live resolution point for them,
+     * not just a defense-in-depth backstop for non-HTTP callers. */
     for (const file of this.files) {
       validateFilePath(file.name, '/tmp/codeapi-request-validation');
-      const conflict = findRequestedConflict(file.name, file);
       /* Same policy as `reserveInputDestination`, applied to the requested
        * names: the same storage object attached twice is a duplicate to
-       * drop, not a conflict to fail on. */
-      if (conflict && conflict[0] === file.name && isSameStorageObject(conflict[1], file)) {
+       * drop, not a conflict to fail on. Exact holder first, for the reason
+       * given there. */
+      const holder = requestedDestinations.get(file.name);
+      if (holder && holder !== file && isSameStorageObject(holder, file)) {
         this.log.info(
           { fileId: file.id, destination: file.name },
           'Dropping a duplicate request ref for an already-claimed destination',
@@ -1031,10 +1113,13 @@ export class Job {
        * resolved now. A by-reference name is only a fallback until the
        * download resolves its Content-Disposition, so leave it to
        * `reserveInputDestination` rather than renaming on a guess. */
-      if (conflict && !file.id) {
+      const requestedConflict = findRequestedConflict(file.name, file);
+      if (requestedConflict && !file.id) {
         file.name = disambiguateDestination(
           file.name,
-          candidate => findRequestedConflict(candidate, file) !== undefined,
+          requestedConflict[0],
+          candidate => findRequestedConflict(candidate, file) !== undefined
+            || this.sessionHoldsDestination(candidate),
         );
       }
       requestedDestinations.set(file.name, file);
@@ -1144,13 +1229,10 @@ export class Job {
     context: PrimeOperationContext,
   ): Promise<void> {
     throwIfAborted(context.signal);
-    if (this.session && file.id && (await this.reusePrimedInput(file, context))) {
-      /* Reuse has no response header to pass through downloadAndWriteFile, so
-       * its requested name becomes authoritative only after the on-disk copy
-       * has been verified. Reserve it before another concurrent ref can claim
-       * and overwrite that path. */
-      const reservation = this.reserveInputDestination(file, file.name);
-      if (reservation.status === 'duplicate') {
+    if (this.session && file.id) {
+      const outcome = await this.reusePrimedInput(file, context);
+      if (outcome === 'reused') return;
+      if (outcome === 'duplicate') {
         this.log.info(
           { fileId: file.id, destination: file.name },
           'Dropping a duplicate ref already primed at this destination',
@@ -1158,13 +1240,9 @@ export class Job {
         this.droppedInputRefs.add(file);
         return;
       }
-      /* An exact reservation means the verified on-disk copy is ours to keep.
-       * A disambiguated one means a different object owns this path, so the
-       * reused bytes are NOT at the reserved destination — drop the stale
-       * hash and download to the new path instead. */
-      if (reservation.destination === file.name) return;
-      this.releaseInputDestinations(file);
-      this.inputFileHashes.delete(file.name);
+      /* `miss` and `contested` both fall through to a real download —
+       * `contested` because a different object owns this path, so the
+       * verified on-disk copy is not ours to keep. */
     }
     const name = await this.downloadAndWriteFile(file, 5, 500, context);
     if (this.droppedInputRefs.has(file)) return;
@@ -1186,11 +1264,11 @@ export class Job {
   private async reusePrimedInput(
     file: TFile,
     context?: PrimeOperationContext,
-  ): Promise<boolean> {
+  ): Promise<ReuseOutcome> {
     const session = this.session;
-    if (!session || !file.id) return false;
+    if (!session || !file.id) return 'miss';
     throwIfAborted(context?.signal);
-    if (session.primedInputId(file.name) !== this.inputIdentity(file)) return false;
+    if (session.primedInputId(file.name) !== this.inputIdentity(file)) return 'miss';
     const submissionDir = context?.submissionDir ?? this.submissionDir;
     const filePath = path.join(submissionDir, file.name);
     /* lstat/O_NOFOLLOW protect only their final path component. A prior
@@ -1199,17 +1277,18 @@ export class Job {
      * path. Keep this outside the missing-file fallback catch: a symlinked
      * ancestor is a hard session-integrity failure, not a cache miss. */
     await this.ensureDirNoFollow(path.dirname(filePath), submissionDir);
+    let info: InputFileInfo;
     try {
       const st = await fsp.lstat(filePath);
       throwIfAborted(context?.signal);
-      if (!st.isFile()) return false;
+      if (!st.isFile()) return 'miss';
       /* Baseline against the ORIGINAL upload hash (recorded at prime time), not
        * a re-hash of the on-disk copy: a prior turn may have mutated it in
        * place, and re-hashing would bank the mutation as pristine and let the
        * walker echo the original ref as unchanged. Falls back to hashing on
        * disk if no original hash was retained. */
-      const hash = this.session?.primedHash(file.name) ?? (await this.computeFileHash(filePath, true));
-      this.inputFileHashes.set(file.name, {
+      const hash = session.primedHash(file.name) ?? (await this.computeFileHash(filePath, true));
+      info = {
         originalId: file.id,
         originalSessionId: file.storage_session_id,
         hash,
@@ -1219,11 +1298,30 @@ export class Job {
          * changed file and surface it, instead of dropping the modification
          * per the read-only contract. */
         readOnly: session.isPrimedReadOnly(file.name) || undefined,
-      });
-      return true;
+      };
     } catch {
-      return false;
+      return 'miss';
     }
+    /* Claim the destination BEFORE committing the entry, with no await in
+     * between. Every step above yields — the `computeFileHash` fallback reads
+     * the whole file — so a concurrent ref for a DIFFERENT object can resolve
+     * this same path, reserve it, write it, and commit its own entry while we
+     * are suspended. Committing first would clobber that owner's entry, and
+     * unwinding afterwards would delete it by name with no ownership test,
+     * leaving the owner's bytes on disk with no `InputFileInfo`. The walker
+     * then treats them as a primed-but-not-re-sent file and silently drops
+     * them from the response. */
+    const reservation = this.reserveInputDestination(file, file.name);
+    if (reservation.status === 'duplicate') return 'duplicate';
+    if (reservation.destination !== file.name) {
+      /* A different object owns this path, so the copy we just verified is
+       * not ours. Release the invented placeholder and let the caller
+       * download to its authoritative destination. Nothing was committed. */
+      this.releaseInputDestinations(file);
+      return 'contested';
+    }
+    this.inputFileHashes.set(file.name, info);
+    return 'reused';
   }
 
   private fileEgressBaseUrl(): string {

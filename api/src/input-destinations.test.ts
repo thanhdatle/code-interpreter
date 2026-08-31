@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'bun:test';
 import * as fsp from 'fs/promises';
+import * as crypto from 'crypto';
 import * as path from 'path';
 import * as os from 'os';
 import * as semver from 'semver';
@@ -11,7 +12,8 @@ import {
 } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
-import type { SessionWorkspace } from './session-workspace';
+import { SessionWorkspace } from './session-workspace';
+import { inputCacheKey } from './session-inputs';
 import { fallbackSandboxIdentity } from './workspace-isolation';
 
 /**
@@ -41,6 +43,7 @@ interface JobInternals {
   files: TFile[];
   inputDestinations: Map<string, TFile>;
   droppedInputRefs: Set<TFile>;
+  inputFileHashes: Map<string, { originalId?: string; originalSessionId?: string; hash: string }>;
 }
 
 function asInternals(job: Job): JobInternals {
@@ -79,15 +82,18 @@ function makeRuntime(): Runtime {
   };
 }
 
-function sessionWorkspaceAt(dir: string, runtimeSessionId: string, markDirty: () => void = () => {}): SessionWorkspace {
+/**
+ * A real `SessionWorkspace` with only the workspace lease stubbed — acquiring
+ * a genuine one needs a UID slot and a privileged on-disk workspace. All the
+ * priming/surfacing bookkeeping the reuse path depends on is the real thing,
+ * so these tests exercise `primedInputId`, `primedHash` and `markPrimed`
+ * rather than a hand-written approximation of them.
+ */
+function sessionWorkspaceAt(dir: string, runtimeSessionId: string): SessionWorkspace {
+  const session = new SessionWorkspace({ runtimeSessionId });
   const identity = fallbackSandboxIdentity();
-  return {
-    runtimeSessionId,
-    acquire: async () => ({ workspaceId: runtimeSessionId, dir, identity }),
-    primedInputId: () => undefined,
-    markPrimed: () => {},
-    markDirty,
-  } as unknown as SessionWorkspace;
+  session.acquire = async () => ({ workspaceId: runtimeSessionId, dir, identity });
+  return session;
 }
 
 function makeJob(files: TFile[], session: SessionWorkspace): Job {
@@ -184,18 +190,15 @@ describe('duplicate input destinations', () => {
       onRequest: () => { requests += 1; },
     });
 
-    let dirty = false;
-    const job = makeJob(
-      [correct, corrupted],
-      sessionWorkspaceAt(tmpDir, 'rt_same_object_twice', () => { dirty = true; }),
-    );
+    const session = sessionWorkspaceAt(tmpDir, 'rt_same_object_twice');
+    const job = makeJob([correct, corrupted], session);
     const originalConcurrency = config.prime_concurrency;
     config.prime_concurrency = 2;
     try {
       await job.prime();
 
       /* Written once, and the job survived — that is the whole point. */
-      expect(dirty).toBe(false);
+      expect(session.dirtyReason).toBeUndefined();
       expect(await entriesOf(tmpDir)).toEqual([MOJIBAKE_NAME]);
       expect(await fsp.readFile(path.join(tmpDir, MOJIBAKE_NAME), 'utf8')).toBe('report bytes');
       /* Both refs were fetched, because only the response header reveals that
@@ -276,17 +279,14 @@ describe('conflicting input destinations between different objects', () => {
       body: 'faster bytes',
     });
 
-    let dirty = false;
-    const job = makeJob(
-      [slower, faster],
-      sessionWorkspaceAt(tmpDir, 'rt_different_objects_same_name', () => { dirty = true; }),
-    );
+    const session = sessionWorkspaceAt(tmpDir, 'rt_different_objects_same_name');
+    const job = makeJob([slower, faster], session);
     const originalConcurrency = config.prime_concurrency;
     config.prime_concurrency = 2;
     try {
       await job.prime();
 
-      expect(dirty).toBe(false);
+      expect(session.dirtyReason).toBeUndefined();
       /* Both survive: neither object is silently lost, and neither name
        * shadows the other. */
       expect(await entriesOf(tmpDir)).toEqual(
@@ -345,6 +345,28 @@ describe('conflicting input destinations between different objects', () => {
     }
   });
 
+  /* Now reachable end-to-end: `validateExecuteFiles` no longer 400s a
+   * request whose destinations nest. A file reserved at `results` blocks
+   * everything under `results/`, so the nested file has to move its ancestor
+   * component or the search would exhaust and abort the job. */
+  it('relocates a nested inline file blocked by a file at its ancestor path', async () => {
+    const blocker: TFile = { name: 'results', content: 'a file, not a directory' };
+    const nested: TFile = { name: 'results/out.csv', content: 'nested rows' };
+
+    const job = makeJob([blocker, nested], sessionWorkspaceAt(tmpDir, 'rt_ancestor_blocked'));
+    try {
+      await job.prime();
+
+      expect(primedNames(job)).toEqual(['results', 'results (2)/out.csv']);
+      expect(await fsp.readFile(path.join(tmpDir, 'results'), 'utf8'))
+        .toBe('a file, not a directory');
+      expect(await fsp.readFile(path.join(tmpDir, 'results (2)', 'out.csv'), 'utf8'))
+        .toBe('nested rows');
+    } finally {
+      await job.cleanup();
+    }
+  });
+
   it('disambiguates a ref nested under a destination another object owns', async () => {
     const dir: TFile = { name: 'results/out.csv', content: 'nested' };
     const shadow: TFile = { id: 'shadow-id', storage_session_id: 'prev-session', name: 'placeholder' };
@@ -369,31 +391,84 @@ describe('conflicting input destinations between different objects', () => {
 });
 
 describe('disambiguateDestination', () => {
-  it('returns the destination untouched when nothing holds it', () => {
-    expect(disambiguateDestination('report.docx', () => false)).toBe('report.docx');
+  /* Only ever called once a conflict is established, so it always invents a
+   * variant — the caller decides whether disambiguation is needed at all.
+   * That split matters: `isTaken` here is stricter than the conflict test,
+   * and applying it to the original destination would rename files that were
+   * merely primed on an earlier turn. */
+  it('always returns a variant, never the original destination', () => {
+    expect(disambiguateDestination('report.docx', 'report.docx', () => false)).toBe('report (2).docx');
+  });
+
+  it('trims an over-long stem to fit instead of failing the execution', () => {
+    const max = config.max_path_length;
+    const stem = 'n'.repeat(max - '.docx'.length);
+    const atLimit = `${stem}.docx`;
+    expect(atLimit.length).toBe(max);
+
+    const resolved = disambiguateDestination(atLimit, atLimit, c => c === atLimit);
+    expect(resolved.length).toBeLessThanOrEqual(max);
+    expect(resolved.endsWith(' (2).docx')).toBe(true);
+  });
+
+  it('never leaves a lone surrogate half when trimming', () => {
+    const max = config.max_path_length;
+    /* Pad with astral characters so a naive slice lands mid-pair. */
+    const stem = '😀'.repeat(Math.floor((max - '.txt'.length) / 2));
+    const atLimit = `${stem}.txt`;
+    const resolved = disambiguateDestination(atLimit, atLimit, c => c === atLimit);
+    expect(resolved.length).toBeLessThanOrEqual(max);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(resolved)).toBe(false);
+    expect(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(resolved)).toBe(false);
   });
 
   it('inserts the suffix before the extension', () => {
     const taken = new Set(['report.docx']);
-    expect(disambiguateDestination('report.docx', c => taken.has(c))).toBe('report (2).docx');
+    expect(disambiguateDestination('report.docx', 'report.docx', c => taken.has(c)))
+      .toBe('report (2).docx');
   });
 
   it('counts upward past every taken variant', () => {
     const taken = new Set(['a.txt', 'a (2).txt', 'a (3).txt']);
-    expect(disambiguateDestination('a.txt', c => taken.has(c))).toBe('a (4).txt');
+    expect(disambiguateDestination('a.txt', 'a.txt', c => taken.has(c))).toBe('a (4).txt');
   });
 
   it('keeps the directory and handles extensionless and dotfile names', () => {
     const taken = new Set(['dir/sub/report.tar.gz', 'README', '.gitignore']);
     const isTaken = (c: string): boolean => taken.has(c);
-    expect(disambiguateDestination('dir/sub/report.tar.gz', isTaken)).toBe('dir/sub/report.tar (2).gz');
-    expect(disambiguateDestination('README', isTaken)).toBe('README (2)');
+    expect(disambiguateDestination('dir/sub/report.tar.gz', 'dir/sub/report.tar.gz', isTaken))
+      .toBe('dir/sub/report.tar (2).gz');
+    expect(disambiguateDestination('README', 'README', isTaken)).toBe('README (2)');
     /* A leading dot is part of the name, not an extension separator. */
-    expect(disambiguateDestination('.gitignore', isTaken)).toBe('.gitignore (2)');
+    expect(disambiguateDestination('.gitignore', '.gitignore', isTaken)).toBe('.gitignore (2)');
+  });
+
+  /**
+   * A reserved FILE at an ancestor path blocks the whole subtree under it.
+   * Suffixing the basename would produce candidates that are still nested
+   * under the blocker, so every one collides and the search would exhaust
+   * and throw — reviving the abort this change exists to remove.
+   */
+  it('moves the blocking ancestor component, not the basename', () => {
+    const taken = new Set(['results']);
+    const isTaken = (c: string): boolean =>
+      [...taken].some(t => t === c || c.startsWith(`${t}/`) || t.startsWith(`${c}/`));
+    expect(disambiguateDestination('results/out.csv', 'results', isTaken))
+      .toBe('results (2)/out.csv');
+    expect(disambiguateDestination('results/deep/nested.csv', 'results', isTaken))
+      .toBe('results (2)/deep/nested.csv');
+  });
+
+  it('suffixes the basename when the reserved path is nested under it', () => {
+    const taken = new Set(['results/out.csv']);
+    const isTaken = (c: string): boolean =>
+      [...taken].some(t => t === c || c.startsWith(`${t}/`) || t.startsWith(`${c}/`));
+    expect(disambiguateDestination('results', 'results/out.csv', isTaken)).toBe('results (2)');
   });
 
   it('throws only when no valid variant exists at all', () => {
-    expect(() => disambiguateDestination('a.txt', () => true)).toThrow(/Unable to find a free destination/);
+    expect(() => disambiguateDestination('a.txt', 'a.txt', () => true))
+      .toThrow(/Unable to find a free destination/);
   });
 });
 
@@ -414,4 +489,200 @@ describe('isSameStorageObject', () => {
     expect(isSameStorageObject(a, b)).toBe(false);
     expect(isSameStorageObject(a, a)).toBe(false);
   });
+});
+
+/**
+ * The reuse branch of `primeInputFile` skips the network when a prior turn
+ * already primed the same object at the same path. It has three outcomes
+ * beyond a plain miss — reused, duplicate, contested — and all of them now
+ * turn on a destination reservation, so each needs its own coverage.
+ */
+describe('reuse of a prior turn\'s primed input', () => {
+  const PRIOR_BYTES = 'primed last turn';
+
+  async function seedPrimedInput(
+    session: SessionWorkspace,
+    name: string,
+    file: TFile,
+    bytes: string,
+    hash?: string,
+  ): Promise<void> {
+    await fsp.writeFile(path.join(tmpDir, name), bytes);
+    session.markPrimed(name, inputCacheKey(file.storage_session_id!, file.id!), false, hash);
+  }
+
+  function sha256(value: string): string {
+    return crypto.createHash('sha256').update(value).digest('hex');
+  }
+
+  it('reuses the on-disk copy without re-downloading it', async () => {
+    const file: TFile = { id: 'primed-id', storage_session_id: 'prev-session', name: 'kept.csv' };
+    let requests = 0;
+    routes.set(objectPath(file), {
+      status: 200,
+      body: 'should never be fetched',
+      onRequest: () => { requests += 1; },
+    });
+
+    const session = sessionWorkspaceAt(tmpDir, 'rt_reuse_hit');
+    await seedPrimedInput(session, 'kept.csv', file, PRIOR_BYTES, sha256(PRIOR_BYTES));
+
+    const job = makeJob([file], session);
+    try {
+      await job.prime();
+
+      expect(requests).toBe(0);
+      expect(await fsp.readFile(path.join(tmpDir, 'kept.csv'), 'utf8')).toBe(PRIOR_BYTES);
+      /* The reused copy must be committed, or the walker treats it as a
+       * primed-but-not-re-sent file and drops it from the response. */
+      expect(asInternals(job).inputFileHashes.get('kept.csv')).toMatchObject({
+        originalId: 'primed-id',
+        originalSessionId: 'prev-session',
+        hash: sha256(PRIOR_BYTES),
+      });
+    } finally {
+      await job.cleanup();
+    }
+  });
+
+  it('drops a reuse whose destination an identical object already claimed', async () => {
+    /* Same object, two refs: one requested under a stale name that the
+     * download resolves onto the primed path, one requested at the primed
+     * path itself. Sequential priming makes the download claim it first, so
+     * the reuse hits the duplicate outcome. */
+    const shared = { id: 'dup-primed-id', storage_session_id: 'prev-session' };
+    const viaDownload: TFile = { ...shared, name: 'stale-name.csv' };
+    const viaReuse: TFile = { ...shared, name: 'primed.csv' };
+    let requests = 0;
+    routes.set(objectPath(viaDownload), {
+      status: 200,
+      contentDisposition: 'attachment; filename="primed.csv"',
+      body: 'fresh bytes',
+      onRequest: () => { requests += 1; },
+    });
+
+    const session = sessionWorkspaceAt(tmpDir, 'rt_reuse_duplicate');
+    await seedPrimedInput(session, 'primed.csv', viaReuse, PRIOR_BYTES, sha256(PRIOR_BYTES));
+
+    const job = makeJob([viaDownload, viaReuse], session);
+    const originalConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 1;
+    try {
+      await job.prime();
+
+      expect(session.dirtyReason).toBeUndefined();
+      expect(await entriesOf(tmpDir)).toEqual(['primed.csv']);
+      expect(await fsp.readFile(path.join(tmpDir, 'primed.csv'), 'utf8')).toBe('fresh bytes');
+      expect(requests).toBe(1);
+      expect(droppedNames(job)).toEqual(['primed.csv']);
+      /* The surviving ref owns the entry, and it describes the bytes that
+       * are actually on disk. */
+      expect(asInternals(job).inputFileHashes.get('primed.csv')).toMatchObject({
+        originalId: 'dup-primed-id',
+        hash: sha256('fresh bytes'),
+      });
+    } finally {
+      config.prime_concurrency = originalConcurrency;
+      await job.cleanup();
+    }
+  });
+
+  it('re-downloads a contested reuse to a destination of its own', async () => {
+    /* A DIFFERENT object resolves onto the primed path. `lstat` only proves
+     * the path exists, so the reuse check still passes — but the bytes there
+     * now belong to the other object, so the reused ref must not keep them. */
+    const intruder: TFile = { id: 'intruder-id', storage_session_id: 'prev-session', name: 'intruder-fallback.csv' };
+    const primed: TFile = { id: 'primed-id', storage_session_id: 'prev-session', name: 'primed.csv' };
+    routes.set(objectPath(intruder), {
+      status: 200,
+      contentDisposition: 'attachment; filename="primed.csv"',
+      body: 'intruder bytes',
+    });
+    routes.set(objectPath(primed), {
+      status: 200,
+      contentDisposition: 'attachment; filename="primed.csv"',
+      body: 'primed object bytes',
+    });
+
+    const session = sessionWorkspaceAt(tmpDir, 'rt_reuse_contested');
+    await seedPrimedInput(session, 'primed.csv', primed, PRIOR_BYTES, sha256(PRIOR_BYTES));
+
+    const job = makeJob([intruder, primed], session);
+    const originalConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 1;
+    try {
+      await job.prime();
+
+      expect(session.dirtyReason).toBeUndefined();
+      expect(await fsp.readFile(path.join(tmpDir, 'primed.csv'), 'utf8')).toBe('intruder bytes');
+      /* Re-downloaded rather than silently reusing the intruder's bytes. */
+      expect(await fsp.readFile(path.join(tmpDir, 'primed (2).csv'), 'utf8')).toBe('primed object bytes');
+      expect(primedNames(job)).toEqual(['primed.csv', 'primed (2).csv']);
+      expect(droppedNames(job)).toEqual([]);
+
+      const hashes = asInternals(job).inputFileHashes;
+      expect(hashes.get('primed.csv')).toMatchObject({ originalId: 'intruder-id' });
+      expect(hashes.get('primed (2).csv')).toMatchObject({ originalId: 'primed-id' });
+    } finally {
+      config.prime_concurrency = originalConcurrency;
+      await job.cleanup();
+    }
+  });
+
+  it('never lets a contested reuse clobber or delete the owner\'s hash entry', async () => {
+    /* The regression this guards: the reuse path used to commit
+     * `inputFileHashes[name]` BEFORE reserving, then unwind with a
+     * name-keyed delete that had no ownership test. Interleaved with a
+     * different object writing the same path, that left the owner's bytes on
+     * disk with no entry, and the walker silently dropped them from the
+     * response.
+     *
+     * The window is widened deliberately: no primed hash is recorded, so the
+     * reuse falls back to hashing a multi-megabyte file while the competing
+     * download completes. The assertion is the interleaving-independent
+     * invariant — every ref's committed entry describes that ref. */
+    const large = 'x'.repeat(2 * 1024 * 1024);
+    const intruder: TFile = { id: 'race-intruder-id', storage_session_id: 'prev-session', name: 'race-fallback.bin' };
+    const primed: TFile = { id: 'race-primed-id', storage_session_id: 'prev-session', name: 'race.bin' };
+    routes.set(objectPath(intruder), {
+      status: 200,
+      contentDisposition: 'attachment; filename="race.bin"',
+      body: 'intruder bytes',
+      delayMs: 5,
+    });
+    routes.set(objectPath(primed), {
+      status: 200,
+      contentDisposition: 'attachment; filename="race.bin"',
+      body: 'primed object bytes',
+    });
+
+    const session = sessionWorkspaceAt(tmpDir, 'rt_reuse_race');
+    /* No hash argument: forces the computeFileHash fallback. */
+    await seedPrimedInput(session, 'race.bin', primed, large);
+
+    const job = makeJob([intruder, primed], session);
+    const originalConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 2;
+    try {
+      await job.prime();
+
+      expect(session.dirtyReason).toBeUndefined();
+      const names = primedNames(job);
+      expect(new Set(names).size).toBe(2);
+      expect(droppedNames(job)).toEqual([]);
+
+      const hashes = asInternals(job).inputFileHashes;
+      for (const file of asInternals(job).files) {
+        const entry = hashes.get(file.name);
+        /* No ref may be left without an entry, and no ref may be described
+         * by another ref's entry. */
+        expect(entry).toBeDefined();
+        expect(entry?.originalId).toBe(file.id);
+        await fsp.stat(path.join(tmpDir, file.name));
+      }
+    } finally {
+      config.prime_concurrency = originalConcurrency;
+      await job.cleanup();
+    }
+  }, 30_000);
 });

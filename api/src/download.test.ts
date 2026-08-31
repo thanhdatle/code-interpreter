@@ -7,7 +7,7 @@ import { Job, type TFile } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
 import { SANDBOX_DIR_MODE, SANDBOX_FILE_MODE } from './validation';
-import type { SessionWorkspace } from './session-workspace';
+import { SessionWorkspace } from './session-workspace';
 import {
   SANDBOX_READONLY_FILE_MODE,
   compatibilityModeForSkippedChown,
@@ -66,23 +66,17 @@ function makeJob(files: TFile[] = [], session?: SessionWorkspace): Job {
   });
 }
 
-function sessionWorkspaceAt(
-  dir: string,
-  runtimeSessionId: string,
-  markDirty: () => void = () => {},
-): SessionWorkspace {
+/**
+ * A real `SessionWorkspace` with only the workspace lease stubbed — acquiring
+ * a genuine one needs a UID slot and a privileged on-disk workspace. Using the
+ * real object keeps its priming/surfacing bookkeeping honest; a partial stub
+ * silently loses whichever accessors the code under test grows next.
+ */
+function sessionWorkspaceAt(dir: string, runtimeSessionId: string): SessionWorkspace {
+  const session = new SessionWorkspace({ runtimeSessionId });
   const identity = fallbackSandboxIdentity();
-  return {
-    runtimeSessionId,
-    acquire: async () => ({
-      workspaceId: runtimeSessionId,
-      dir,
-      identity,
-    }),
-    primedInputId: () => undefined,
-    markPrimed: () => {},
-    markDirty,
-  } as unknown as SessionWorkspace;
+  session.acquire = async () => ({ workspaceId: runtimeSessionId, dir, identity });
+  return session;
 }
 
 function currentUid(): number | undefined {
@@ -359,11 +353,8 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
       body: 'faster bytes',
     });
 
-    let dirty = false;
-    const job = makeJob(
-      [slower, faster],
-      sessionWorkspaceAt(tmpDir, 'rt_concurrent_same_destination', () => { dirty = true; }),
-    );
+    const session = sessionWorkspaceAt(tmpDir, 'rt_concurrent_same_destination');
+    const job = makeJob([slower, faster], session);
     const originalPrimeConcurrency = config.prime_concurrency;
     config.prime_concurrency = 2;
     let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
@@ -379,7 +370,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
       ]);
       if (deadlockTimer) clearTimeout(deadlockTimer);
       expect(outcome.status).toBe('fulfilled');
-      expect(dirty).toBe(false);
+      expect(session.dirtyReason).toBeUndefined();
       /* Both bodies land, and neither clobbers the other. The faster ref
        * claims the resolved name; the slower one takes the suffixed variant. */
       expect(await fsp.readFile(path.join(tmpDir, 'same.txt'), 'utf8')).toBe('faster bytes');

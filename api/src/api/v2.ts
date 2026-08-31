@@ -36,17 +36,19 @@ import {
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
 
-function existingDestinationConflictMessage(existing: string, destination: string): string {
-  return existing === destination
-    ? `files contains duplicate destination "${destination}"`
-    : `files contains conflicting destinations "${existing}" and "${destination}"`;
-}
-
+/**
+ * Shape validation only. Destination COLLISIONS are deliberately not rejected
+ * here: attaching one file twice, or two genuinely different files that share
+ * a filename, are both things users do routinely, and a 400 made the whole
+ * execution fail. `Job.prime` resolves them instead — identical storage
+ * objects are deduped to a single write, different objects are disambiguated
+ * to `name (2).ext` — and the response reports the real on-disk path for each.
+ * Per-request destination volume is still capped below.
+ */
 export function validateExecuteFiles(files: TFile[]): void {
   if (files.length > config.max_input_files) {
     throw { message: `files cannot contain more than ${config.max_input_files} destinations` };
   }
-  const destinations = new Set<string>();
   for (const [i, value] of files.entries()) {
     if (value == null || typeof value !== 'object' || Array.isArray(value)) {
       throw { message: `files[${i}] must be an object` };
@@ -102,16 +104,6 @@ export function validateExecuteFiles(files: TFile[]): void {
           : `files[${i}].name is invalid`,
       };
     }
-    const conflict = [...destinations].find(
-      existing =>
-        existing === destination ||
-        existing.startsWith(`${destination}/`) ||
-        destination.startsWith(`${existing}/`),
-    );
-    if (conflict) {
-      throw { message: existingDestinationConflictMessage(conflict, destination) };
-    }
-    destinations.add(destination);
   }
 }
 
