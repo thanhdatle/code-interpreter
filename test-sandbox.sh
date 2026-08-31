@@ -285,7 +285,75 @@ if subprocess.run(["pandoc", "-t", "markdown", src],
                   capture_output=True).returncode != 0:
     fail("pandoc could not read the generated docx")
 
-print("DOCUMENTS_OK pages=%d fonts_ok=1" % len(pages))
+# The case docDefaults does NOT cover. LibreOffice ignores a .docx's
+# w:docDefaults inside a table cell, so a cell run that names no font falls
+# through to the generic `serif` family. Without 58-generic-liberation.conf
+# that resolves to DejaVu Serif -- metric-incompatible with Times New Roman,
+# so line breaks and page count drift from Word, and nothing says so except
+# pdffonts. Measured: this exact document rendered DejaVuSerif before the conf
+# was added and LiberationSerif after. Built as raw XML because python-docx
+# always writes an explicit w:rFonts and so cannot reproduce it.
+import zipfile
+
+NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+CELL = ('<w:tc><w:tcPr><w:tcW w:w="4590" w:type="dxa"/></w:tcPr>'
+        '<w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p></w:tc>')
+
+fontless = os.path.join(work, "fontless.docx")
+with zipfile.ZipFile(fontless, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+               '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+               '<Default Extension="xml" ContentType="application/xml"/>'
+               '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+               '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+               '</Types>')
+    z.writestr("_rels/.rels",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+               '</Relationships>')
+    z.writestr("word/_rels/document.xml.rels",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+               '</Relationships>')
+    # The font is declared ONLY here, never on a run. That is the whole point.
+    z.writestr("word/styles.xml",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<w:styles %s><w:docDefaults><w:rPrDefault><w:rPr>'
+               '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>'
+               '<w:sz w:val="26"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>' % NS)
+    z.writestr("word/document.xml",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<w:document %s><w:body>'
+               '<w:tbl><w:tblPr><w:tblW w:w="9180" w:type="dxa"/></w:tblPr>'
+               '<w:tblGrid><w:gridCol w:w="4590"/><w:gridCol w:w="4590"/></w:tblGrid>'
+               '<w:tr>%s%s</w:tr></w:tbl>'
+               '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+               '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1701" '
+               'w:header="706" w:footer="706" w:gutter="0"/></w:sectPr>'
+               '</w:body></w:document>'
+               % (NS, CELL % "Noi nhan", CELL % "Ky ten"))
+
+conv = subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
+                       "--outdir", work, fontless], capture_output=True, text=True)
+fontless_pdf = os.path.join(work, "fontless.pdf")
+if not os.path.exists(fontless_pdf):
+    fail("fontless-run document would not convert (rc=%s) %s"
+         % (conv.returncode, conv.stderr[:200]))
+fl_fonts = subprocess.run(["pdffonts", fontless_pdf],
+                          capture_output=True, text=True).stdout
+for bad in ("DejaVu", "FreeSerif", "NotoSerif"):
+    if bad in fl_fonts:
+        fail("a run with no w:rFonts rendered in %s; generic serif is not "
+             "metric-compatible (is 58-generic-liberation.conf installed?)\n%s"
+             % (bad, fl_fonts))
+if "LiberationSerif" not in fl_fonts and "TimesNewRoman" not in fl_fonts:
+    fail("fontless run rendered in an unexpected face:\n" + fl_fonts)
+
+print("DOCUMENTS_OK pages=%d fonts_ok=1 fontless_ok=1" % len(pages))
 DOCPY
 )
     payload=$(jq -n --arg code "$doc_code" \

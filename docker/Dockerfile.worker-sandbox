@@ -147,22 +147,42 @@ RUN apt-install \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
 
-# Bake a LibreOffice user profile at build time and install a soffice wrapper
-# that seeds it into the sandbox HOME on first use. The guest root is read-only
-# and HOME is a fresh per-session bind, so without this LibreOffice rebuilds its
-# profile on the first render of every session: ~7.5s cold versus ~3.6s warm
-# (measured on LO 26.2; this image ships 7.4.7 on 2 vCPU, so slower), against a
-# hard 30s SANDBOX_RUN_TIMEOUT that must also cover the document build,
-# rasterise and text extraction in the same execution.
-#
-# Converting a throwaway file here is also the build's own proof that soffice
-# can actually convert -- the build fails if it cannot.
-RUN mkdir -p /opt/lo-home \
-    && printf 'warm-up' > /tmp/lo-warm.txt \
-    && HOME=/opt/lo-home soffice --headless --convert-to pdf --outdir /tmp /tmp/lo-warm.txt \
-    && [ -s /tmp/lo-warm.pdf ] \
-    && rm -f /tmp/lo-warm.txt /tmp/lo-warm.pdf /opt/lo-home/.config/libreoffice/4/.lock
+# Generic font families must resolve to metric-compatible faces.
+# 30-metric-aliases.conf only maps *named* fonts (Times New Roman -> Liberation
+# Serif). A run that names no font at all falls through to the generic `serif`
+# family, which 60-latin.conf resolves to DejaVu Serif. That path is reached in
+# practice: LibreOffice does not apply a .docx's w:docDefaults to table cell
+# runs, so a fontless cell renders in DejaVu, whose metrics differ from Times
+# New Roman -- different line breaks and page count than Word, visible only in
+# `pdffonts`. DejaVu stays installed as the wide-coverage glyph fallback.
+COPY docker/fonts/58-generic-liberation.conf /etc/fonts/conf.d/58-generic-liberation.conf
 
+# Two build-time canaries in one layer: the font policy resolves as intended,
+# and headless soffice can actually convert under it. A fontconfig renumbering,
+# a dropped COPY or a broken LibreOffice install fails the build rather than
+# shipping. This step leaves no state behind -- an earlier version baked a
+# LibreOffice user profile into the image to skip its first-run cost, but
+# measured here that is ~600ms once per session (759ms cold vs 148ms warm)
+# against a 300s SANDBOX_RUN_TIMEOUT, and the baked profile was created mode
+# 0700 root, so the sandbox's non-root uid could not read it in any case.
+#
+# Unlike `fc-match ... | grep -q`, the case test cannot be defeated by a
+# SIGPIPE-poisoned pipeline, and it says what it expected when it fails.
+RUN fc-cache -f \
+    && for pair in "serif:Liberation Serif" "sans-serif:Liberation Sans" "monospace:Liberation Mono"; do \
+           family="${pair%%:*}"; want="${pair#*:}"; got="$(fc-match "$family")"; \
+           case "$got" in \
+               *"$want"*) ;; \
+               *) echo "fc-match $family -> $got, expected $want" >&2; exit 1 ;; \
+           esac; \
+       done \
+    && printf 'smoke' > /tmp/lo-smoke.txt \
+    && HOME=/tmp/lo-smoke-home soffice --headless --convert-to pdf --outdir /tmp /tmp/lo-smoke.txt \
+    && [ -s /tmp/lo-smoke.pdf ] \
+    && rm -rf /tmp/lo-smoke.txt /tmp/lo-smoke.pdf /tmp/lo-smoke-home
+
+# LibreOffice silently drops content when /tmp is near full; the wrapper moves
+# its temporaries onto HOME. See docker/soffice-wrapper.sh for the measurement.
 COPY docker/soffice-wrapper.sh /usr/local/bin/soffice
 RUN chmod +x /usr/local/bin/soffice
 
