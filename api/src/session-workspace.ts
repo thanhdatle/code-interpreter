@@ -164,6 +164,14 @@ export class SessionWorkspace {
     return this.surfaced.get(relPath) === hash;
   }
 
+  /** Whether any output has been surfaced at `relPath`, whatever its content.
+   *  Lets a caller inventing a destination avoid renaming over a prior turn's
+   *  output, which `isSurfaced` cannot answer without already knowing the
+   *  hash of bytes that have not been written yet. */
+  hasSurfacedOutput(relPath: string): boolean {
+    return this.surfaced.has(relPath);
+  }
+
   markSurfaced(relPath: string, hash: string): void {
     this.surfaced.set(relPath, hash);
   }
@@ -178,6 +186,13 @@ export class SessionWorkspace {
     const entry = this.primed.get(relPath);
     if (!entry || entry.readOnly) return undefined;
     return entry.id;
+  }
+
+  /** Which storage object a prior turn primed at `relPath`, or undefined.
+   *  Unlike `primedInputId` this reports read-only primes too: it answers
+   *  "whose copy is this", not "may it be reused without re-downloading". */
+  primedOwnerId(relPath: string): string | undefined {
+    return this.primed.get(relPath)?.id;
   }
 
   /** Whether `relPath` was primed as an input on any earlier turn (regardless

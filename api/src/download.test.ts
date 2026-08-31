@@ -3,11 +3,11 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import * as semver from 'semver';
-import { Job, SessionWorkspaceDirtyError, type TFile } from './job';
+import { Job, type TFile } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
 import { SANDBOX_DIR_MODE, SANDBOX_FILE_MODE } from './validation';
-import type { SessionWorkspace } from './session-workspace';
+import { SessionWorkspace } from './session-workspace';
 import {
   SANDBOX_READONLY_FILE_MODE,
   compatibilityModeForSkippedChown,
@@ -66,23 +66,17 @@ function makeJob(files: TFile[] = [], session?: SessionWorkspace): Job {
   });
 }
 
-function sessionWorkspaceAt(
-  dir: string,
-  runtimeSessionId: string,
-  markDirty: () => void = () => {},
-): SessionWorkspace {
+/**
+ * A real `SessionWorkspace` with only the workspace lease stubbed — acquiring
+ * a genuine one needs a UID slot and a privileged on-disk workspace. Using the
+ * real object keeps its priming/surfacing bookkeeping honest; a partial stub
+ * silently loses whichever accessors the code under test grows next.
+ */
+function sessionWorkspaceAt(dir: string, runtimeSessionId: string): SessionWorkspace {
+  const session = new SessionWorkspace({ runtimeSessionId });
   const identity = fallbackSandboxIdentity();
-  return {
-    runtimeSessionId,
-    acquire: async () => ({
-      workspaceId: runtimeSessionId,
-      dir,
-      identity,
-    }),
-    primedInputId: () => undefined,
-    markPrimed: () => {},
-    markDirty,
-  } as unknown as SessionWorkspace;
+  session.acquire = async () => ({ workspaceId: runtimeSessionId, dir, identity });
+  return session;
 }
 
 function currentUid(): number | undefined {
@@ -331,7 +325,12 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     }
   });
 
-  it('rejects concurrent refs that resolve to the same destination before either can overwrite', async () => {
+  /* Policy change: a destination collision between two DIFFERENT storage
+   * objects used to fail the whole execution. The caller replays the same
+   * attachment set on every turn, so that made one bad input permanently
+   * fatal for the conversation. Both objects now survive at distinguishable
+   * destinations instead, and neither overwrites the other. */
+  it('disambiguates concurrent refs that resolve to the same destination instead of overwriting', async () => {
     const slower: TFile = {
       id: 'same-slower-id',
       storage_session_id: 'prev-session',
@@ -354,11 +353,8 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
       body: 'faster bytes',
     });
 
-    let dirty = false;
-    const job = makeJob(
-      [slower, faster],
-      sessionWorkspaceAt(tmpDir, 'rt_concurrent_same_destination', () => { dirty = true; }),
-    );
+    const session = sessionWorkspaceAt(tmpDir, 'rt_concurrent_same_destination');
+    const job = makeJob([slower, faster], session);
     const originalPrimeConcurrency = config.prime_concurrency;
     config.prime_concurrency = 2;
     let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
@@ -373,12 +369,12 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
         }),
       ]);
       if (deadlockTimer) clearTimeout(deadlockTimer);
-      expect(outcome.status).toBe('rejected');
-      if (outcome.status === 'rejected') {
-        expect(outcome.error).toBeInstanceOf(SessionWorkspaceDirtyError);
-      }
-      expect(dirty).toBe(true);
+      expect(outcome.status).toBe('fulfilled');
+      expect(session.dirtyReason).toBeUndefined();
+      /* Both bodies land, and neither clobbers the other. The faster ref
+       * claims the resolved name; the slower one takes the suffixed variant. */
       expect(await fsp.readFile(path.join(tmpDir, 'same.txt'), 'utf8')).toBe('faster bytes');
+      expect(await fsp.readFile(path.join(tmpDir, 'same (2).txt'), 'utf8')).toBe('slower bytes');
     } finally {
       if (deadlockTimer) clearTimeout(deadlockTimer);
       config.prime_concurrency = originalPrimeConcurrency;

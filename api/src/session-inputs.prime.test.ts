@@ -101,7 +101,7 @@ describe('priming from the pushed input cache', () => {
     const job = makeJob([], session);
     const internals = job as unknown as {
       submissionDir: string;
-      reusePrimedInput(file: TFile): Promise<boolean>;
+      reusePrimedInput(file: TFile): Promise<string>;
       inputFileHashes: Map<string, {
         originalId?: string;
         originalSessionId?: string;
@@ -117,7 +117,7 @@ describe('priming from the pushed input cache', () => {
       name: 'data.csv',
     });
 
-    expect(reused).toBe(true);
+    expect(reused).toBe('reused');
     expect(await fsp.readFile(path.join(tmpDir, 'data.csv'), 'utf8')).toBe('sandbox-modified\n');
     expect(internals.inputFileHashes.get('data.csv')).toMatchObject({
       originalId: 'second-grant-object-handle',

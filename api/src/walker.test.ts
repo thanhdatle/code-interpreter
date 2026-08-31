@@ -29,7 +29,7 @@ interface WalkerInternals {
   pendingSurfaced: Map<string, { name: string; signature: string }>;
   inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string; readOnly?: boolean }>;
   files: TFile[];
-  reusePrimedInput: (file: TFile) => Promise<boolean>;
+  reusePrimedInput: (file: TFile) => Promise<string>;
   writeFile: (file: TFile) => Promise<void>;
   walkDir: (dir: string, depth: number, inputByName: Map<string, TFile>) => Promise<'collected' | 'empty' | 'skipped'>;
   handleSessionFiles: () => Promise<void>;
@@ -493,7 +493,7 @@ describe('walkDir / regular file handling', () => {
     const reusedJob = makeJob({ session });
     const reused = asInternals(reusedJob);
     reused.submissionDir = tmpDir;
-    expect(await reused.reusePrimedInput(downloaded)).toBe(true);
+    expect(await reused.reusePrimedInput(downloaded)).toBe('reused');
     await reused.walkDir(tmpDir, 0, buildInputByName([downloaded]));
 
     expect(reused.generatedFiles).toHaveLength(0);
@@ -505,7 +505,7 @@ describe('walkDir / regular file handling', () => {
     const changedAgainJob = makeJob({ session });
     const changedAgain = asInternals(changedAgainJob);
     changedAgain.submissionDir = tmpDir;
-    expect(await changedAgain.reusePrimedInput(downloaded)).toBe(true);
+    expect(await changedAgain.reusePrimedInput(downloaded)).toBe('reused');
     await changedAgain.walkDir(tmpDir, 0, buildInputByName([downloaded]));
 
     expect(changedAgain.generatedFiles.map(file => file.name)).toEqual([name]);
