@@ -104,6 +104,13 @@ const claims = {
   iat: now,
   exp: now + numberEnv('EXECUTION_MANIFEST_TTL_SECONDS', 300),
   principal_source: 'local_sandbox_smoke',
+  // Must cover the final body, so every payload mutation above has to be done
+  // by now. The runner digests the body with `execution_manifest` stripped,
+  // which is exactly the payload as it stands before the field is added below.
+  execute_body_sha256: crypto
+    .createHash('sha256')
+    .update(canonicalJson(payload), 'utf8')
+    .digest('base64url'),
 };
 const manifestPayload = canonicalJson(claims);
 const rawPrivateKey = process.env.CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY.trim().replace(/\\n/g, '\n');
@@ -127,6 +134,31 @@ execute_sandbox() {
     curl -s "$SANDBOX_URL/api/v2/execute" \
         -H 'Content-Type: application/json' \
         -d "$body"
+}
+
+MANIFEST_SIGNATURE_REJECTION="Execution manifest signature is invalid"
+
+# A rejected manifest makes every execution below return no output, which reads
+# as a broken sandbox rather than a misconfigured caller: the security tests
+# report false regressions and the escape test passes because nothing ran.
+# The runner reports only `{"message": ...}` and reuses 403 for every manifest
+# reason, so assert the no-op actually ran instead of enumerating rejections.
+preflight_execution() {
+    local result code message
+    if ! result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"pass"}]}'); then
+        log_error "preflight execution failed: $SANDBOX_URL is unreachable or manifest signing failed"
+        exit 1
+    fi
+    code=$(echo "$result" | jq -r '.run.code // empty' 2>/dev/null || true)
+    [[ "$code" == "0" ]] && return 0
+    message=$(echo "$result" | jq -r '.message // empty' 2>/dev/null || true)
+    if [[ "$message" == *"$MANIFEST_SIGNATURE_REJECTION"* ]]; then
+        log_error "execution manifest signature rejected — the deployment's keypair does not match CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY"
+    else
+        log_error "preflight no-op did not execute; response: $result"
+    fi
+    log_error "Aborting before any test: no code would run, and the results would look like sandbox failures."
+    exit 1
 }
 
 test_basic_python() {
@@ -576,6 +608,8 @@ echo "  Sandbox Security Test Suite"
 echo "=============================================="
 echo "Target: $SANDBOX_URL"
 echo ""
+
+preflight_execution
 
 FAILED=0
 
