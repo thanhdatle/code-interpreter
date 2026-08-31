@@ -178,6 +178,7 @@ install_python_packages() {
         sympy \
         wordcloud \
         pypdf2 \
+        pypdf \
         python-docx \
         imageio \
         seaborn \

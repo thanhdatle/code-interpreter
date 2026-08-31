@@ -135,6 +135,7 @@ services:
     ports:
       - "3112-3119:3112"  # Port range for multiple instances
     environment:
+      - SANDBOX_RUN_MEMORY_LIMIT=${SANDBOX_RUN_MEMORY_LIMIT:-1073741824}
       - LOCAL_MODE=${LOCAL_MODE:-true}
       - FILE_SERVER_URL=http://file_server:3000
       - TOOL_CALL_SERVER_URL=http://tool_call_server:3033

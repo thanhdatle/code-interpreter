@@ -19,3 +19,6 @@ data/
 
 # Editor config
 .vscode/
+
+# Local-only macOS/Colima AppArmor workaround; must not ship
+docker-compose.local-apparmor.yml

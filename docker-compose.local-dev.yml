@@ -106,6 +106,7 @@ services:
     ports:
       - 3112:3112
     environment:
+      - SANDBOX_RUN_MEMORY_LIMIT=${SANDBOX_RUN_MEMORY_LIMIT:-1073741824}
       - LOCAL_MODE=${LOCAL_MODE:-true}
       - SANDBOX_ENDPOINT=http://sandbox:2000/api/v2
       - FILE_SERVER_URL=http://file_server:3000

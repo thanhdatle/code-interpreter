@@ -207,6 +207,170 @@ test_chdb() {
     fi
 }
 
+test_documents() {
+    log_info "Testing document toolchain (LibreOffice, pandoc, poppler, fonts)..."
+    # jq -n --arg does the JSON escaping; hand-escaping a program this size into
+    # a JSON string is where this test would silently break.
+    doc_code=$(cat <<'DOCPY'
+import os, shutil, subprocess, sys
+
+def fail(msg):
+    print("DOCUMENTS_FAIL: " + msg)
+    sys.exit(1)
+
+for tool in ("soffice", "pandoc", "pdftoppm", "pdftotext", "pdffonts", "fc-match"):
+    if not shutil.which(tool):
+        fail("missing binary: " + tool)
+
+try:
+    import docx, openpyxl, pypdf
+except ImportError as exc:
+    fail("missing python package: %s" % exc)
+
+# Having a font installed is not the same as fontconfig choosing it.
+# 30-metric-aliases.conf is what maps Times New Roman onto Liberation Serif;
+# without it the request falls through to DejaVu, which is installed alongside
+# and is NOT metric-compatible.
+matched = subprocess.run(["fc-match", "Times New Roman"],
+                         capture_output=True, text=True).stdout.strip()
+if "Liberation" not in matched and "Times" not in matched:
+    fail("fontconfig resolves Times New Roman -> %s (need fontconfig-config)" % matched)
+
+work = "/mnt/data"
+src = os.path.join(work, "doctest.docx")
+doc = docx.Document()
+normal = doc.styles["Normal"]
+normal.font.name = "Times New Roman"
+normal.font.size = docx.shared.Pt(13)
+for line in ("CONG HOA XA HOI CHU NGHIA VIET NAM",
+             "Doc lap - Tu do - Hanh phuc",
+             "KE HOACH",
+             "Uy ban nhan dan",
+             "Luu: VT."):
+    doc.add_paragraph(line)
+# Diacritics are the point of the round trip, so assert on a real one.
+doc.add_paragraph("Ủy ban nhân dân — KẾ HOẠCH — Độc lập")
+doc.save(src)
+
+conv = subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
+                       "--outdir", work, src], capture_output=True, text=True)
+pdf = os.path.join(work, "doctest.pdf")
+if not os.path.exists(pdf):
+    fail("soffice produced no PDF (rc=%s) %s" % (conv.returncode, conv.stderr[:200]))
+
+fonts = subprocess.run(["pdffonts", pdf], capture_output=True, text=True).stdout
+if "TimesNewRoman" not in fonts and "LiberationSerif" not in fonts:
+    fail("no metric-compatible serif in the render:\n" + fonts)
+for bad in ("DejaVu", "FreeSerif", "NotoSerif"):
+    if bad in fonts:
+        fail("non-metric-compatible substitution (%s); layout differs from Word" % bad)
+
+subprocess.run(["pdftoppm", "-jpeg", "-r", "100", pdf, os.path.join(work, "page")],
+               check=True, capture_output=True)
+pages = [f for f in os.listdir(work) if f.startswith("page") and f.endswith(".jpg")]
+if not pages:
+    fail("pdftoppm produced no page images")
+# The agent reads these back with read_file, which refuses anything over 1 MB.
+for page in pages:
+    size = os.path.getsize(os.path.join(work, page))
+    if size > 1048576:
+        fail("%s is %d bytes (>1MB): re-render at 72 dpi" % (page, size))
+
+text = subprocess.run(["pdftotext", pdf, "-"], capture_output=True, text=True).stdout
+for phrase in ("Ủy ban nhân dân", "KẾ HOẠCH", "Độc lập"):
+    if phrase not in text:
+        fail("lost text or diacritics: %r missing from the PDF" % phrase)
+
+if subprocess.run(["pandoc", "-t", "markdown", src],
+                  capture_output=True).returncode != 0:
+    fail("pandoc could not read the generated docx")
+
+# The case docDefaults does NOT cover. LibreOffice ignores a .docx's
+# w:docDefaults inside a table cell, so a cell run that names no font falls
+# through to the generic `serif` family. Without 58-generic-liberation.conf
+# that resolves to DejaVu Serif -- metric-incompatible with Times New Roman,
+# so line breaks and page count drift from Word, and nothing says so except
+# pdffonts. Measured: this exact document rendered DejaVuSerif before the conf
+# was added and LiberationSerif after. Built as raw XML because python-docx
+# always writes an explicit w:rFonts and so cannot reproduce it.
+import zipfile
+
+NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+CELL = ('<w:tc><w:tcPr><w:tcW w:w="4590" w:type="dxa"/></w:tcPr>'
+        '<w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p></w:tc>')
+
+fontless = os.path.join(work, "fontless.docx")
+with zipfile.ZipFile(fontless, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+               '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+               '<Default Extension="xml" ContentType="application/xml"/>'
+               '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+               '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+               '</Types>')
+    z.writestr("_rels/.rels",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+               '</Relationships>')
+    z.writestr("word/_rels/document.xml.rels",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+               '</Relationships>')
+    # The font is declared ONLY here, never on a run. That is the whole point.
+    z.writestr("word/styles.xml",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<w:styles %s><w:docDefaults><w:rPrDefault><w:rPr>'
+               '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/>'
+               '<w:sz w:val="26"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>' % NS)
+    z.writestr("word/document.xml",
+               '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<w:document %s><w:body>'
+               '<w:tbl><w:tblPr><w:tblW w:w="9180" w:type="dxa"/></w:tblPr>'
+               '<w:tblGrid><w:gridCol w:w="4590"/><w:gridCol w:w="4590"/></w:tblGrid>'
+               '<w:tr>%s%s</w:tr></w:tbl>'
+               '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+               '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1701" '
+               'w:header="706" w:footer="706" w:gutter="0"/></w:sectPr>'
+               '</w:body></w:document>'
+               % (NS, CELL % "Noi nhan", CELL % "Ky ten"))
+
+conv = subprocess.run(["soffice", "--headless", "--convert-to", "pdf",
+                       "--outdir", work, fontless], capture_output=True, text=True)
+fontless_pdf = os.path.join(work, "fontless.pdf")
+if not os.path.exists(fontless_pdf):
+    fail("fontless-run document would not convert (rc=%s) %s"
+         % (conv.returncode, conv.stderr[:200]))
+fl_fonts = subprocess.run(["pdffonts", fontless_pdf],
+                          capture_output=True, text=True).stdout
+for bad in ("DejaVu", "FreeSerif", "NotoSerif"):
+    if bad in fl_fonts:
+        fail("a run with no w:rFonts rendered in %s; generic serif is not "
+             "metric-compatible (is 58-generic-liberation.conf installed?)\n%s"
+             % (bad, fl_fonts))
+if "LiberationSerif" not in fl_fonts and "TimesNewRoman" not in fl_fonts:
+    fail("fontless run rendered in an unexpected face:\n" + fl_fonts)
+
+print("DOCUMENTS_OK pages=%d fonts_ok=1 fontless_ok=1" % len(pages))
+DOCPY
+)
+    payload=$(jq -n --arg code "$doc_code" \
+        '{language:"python",version:"3.14.4",files:[{content:$code}]}')
+    result=$(execute_sandbox "$payload")
+
+    stdout=$(echo "$result" | jq -r '.run.stdout // empty')
+    if [[ "$stdout" == *"DOCUMENTS_OK"* ]]; then
+        log_success "documents: $(echo "$stdout" | tr -d '\n')"
+        return 0
+    else
+        log_error "documents: $stdout"
+        echo "$result" | jq .
+        return 1
+    fi
+}
+
 test_file_write() {
     log_info "Testing file write in sandbox..."
     result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"with open(\"/mnt/data/test.txt\", \"w\") as f:\n    f.write(\"hello\")\nwith open(\"/mnt/data/test.txt\") as f:\n    print(f.read())"}]}')
@@ -420,6 +584,7 @@ test_numpy || FAILED=$((FAILED + 1))
 test_statsmodels || FAILED=$((FAILED + 1))
 test_geospatial || FAILED=$((FAILED + 1))
 test_chdb || FAILED=$((FAILED + 1))
+test_documents || FAILED=$((FAILED + 1))
 test_file_write || FAILED=$((FAILED + 1))
 test_network_blocked || FAILED=$((FAILED + 1))
 test_sched_setaffinity_blocked || FAILED=$((FAILED + 1))

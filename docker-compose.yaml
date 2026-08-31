@@ -8,6 +8,7 @@ services:
         ports:
             - 3112:3112
         environment:
+            - SANDBOX_RUN_MEMORY_LIMIT=${SANDBOX_RUN_MEMORY_LIMIT:-1073741824}
             - LOCAL_MODE=${LOCAL_MODE:-true}
             - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
@@ -52,6 +53,7 @@ services:
             target: worker
         container_name: service-worker
         environment:
+            - SANDBOX_RUN_MEMORY_LIMIT=${SANDBOX_RUN_MEMORY_LIMIT:-1073741824}
             - LOCAL_MODE=${LOCAL_MODE:-true}
             - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
